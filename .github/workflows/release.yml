@@ -16,12 +16,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+            zig_target: ""
+            ext: ""
+          - os: ubuntu-latest
+            target: linux-aarch64
+            zig_target: aarch64-linux-musl
             ext: ""
           - os: macos-latest
             target: macos-aarch64
+            zig_target: ""
             ext: ""
           - os: windows-latest
             target: windows-x86_64
+            zig_target: ""
             ext: ".exe"
 
     steps:
@@ -33,7 +40,7 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall
+        run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -53,6 +60,7 @@ jobs:
       - name: Rename binaries
         run: |
           mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
+          mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
           mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
           mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
 
@@ -61,6 +69,7 @@ jobs:
         with:
           files: |
             nullclaw-linux-x86_64.bin
+            nullclaw-linux-aarch64.bin
             nullclaw-macos-aarch64.bin
             nullclaw-windows-x86_64.exe
           generate_release_notes: true

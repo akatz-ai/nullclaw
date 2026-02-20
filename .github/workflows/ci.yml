@@ -45,6 +45,10 @@ jobs:
       - name: Build ReleaseSmall
         run: zig build -Doptimize=ReleaseSmall
 
+      - name: Cross-compile linux-aarch64 (Termux/ARM)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
+
       - name: Job summary
         if: always()
         run: |
