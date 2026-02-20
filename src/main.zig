@@ -40,7 +40,8 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "service", .service },
         .{ "status", .status },
         .{ "version", .version },
-        .{ "-v", .version },
+        .{ "--version", .version },
+        .{ "-V", .version },
         .{ "onboard", .onboard },
         .{ "doctor", .doctor },
         .{ "cron", .cron },
@@ -1244,7 +1245,7 @@ fn printUsage() void {
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  daemon [--port PORT] [--host HOST]
-        \\  version | -v
+        \\  version | --version | -V
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
         \\  channel <list|start|doctor|add|remove> [ARGS]
@@ -1262,6 +1263,8 @@ test "parse known commands" {
     try std.testing.expectEqual(.agent, parseCommand("agent").?);
     try std.testing.expectEqual(.status, parseCommand("status").?);
     try std.testing.expectEqual(.version, parseCommand("version").?);
+    try std.testing.expectEqual(.version, parseCommand("--version").?);
+    try std.testing.expectEqual(.version, parseCommand("-V").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
