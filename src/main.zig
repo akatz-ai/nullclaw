@@ -761,6 +761,20 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     else
         null;
 
+    if (mcp_tools) |mt| {
+        std.debug.print("  MCP tools: {d}\n", .{mt.len});
+    }
+
+    // Create optional memory backend (must be created before tools so tools get the reference)
+    var mem_opt: ?yc.memory.Memory = null;
+    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
+    defer if (db_path) |p| allocator.free(p);
+    if (db_path) |p| {
+        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
+            mem_opt = mem;
+        } else |_| {}
+    }
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -770,22 +784,9 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .agents = config.agents,
         .fallback_api_key = config.defaultProviderKey(),
         .tools_config = config.tools,
+        .memory = mem_opt,
     }) catch &.{};
     defer if (tools.len > 0) allocator.free(tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_opt: ?yc.memory.Memory = null;
-    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
-    defer if (db_path) |p| allocator.free(p);
-    if (db_path) |p| {
-        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
-            mem_opt = mem;
-        } else |_| {}
-    }
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};

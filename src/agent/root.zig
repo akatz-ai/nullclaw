@@ -1169,6 +1169,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     else
         null;
 
+    // Create memory (optional — must be created before tools so tools get the reference)
+    var mem_opt: ?Memory = null;
+    const db_path = try std.fs.path.joinZ(allocator, &.{ cfg.workspace_dir, "memory.db" });
+    defer allocator.free(db_path);
+    if (memory_mod.createMemory(allocator, cfg.memory.backend, db_path)) |mem| {
+        mem_opt = mem;
+    } else |_| {}
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
@@ -1177,16 +1185,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .agents = cfg.agents,
         .fallback_api_key = cfg.defaultProviderKey(),
         .tools_config = cfg.tools,
+        .memory = mem_opt,
     });
     defer allocator.free(tools);
-
-    // Create memory (optional — don't fail if it can't init)
-    var mem_opt: ?Memory = null;
-    const db_path = try std.fs.path.joinZ(allocator, &.{ cfg.workspace_dir, "memory.db" });
-    defer allocator.free(db_path);
-    if (memory_mod.createMemory(allocator, cfg.memory.backend, db_path)) |mem| {
-        mem_opt = mem;
-    } else |_| {}
 
     // Create provider via ProviderHolder (concrete struct lives on the stack)
     const ProviderHolder = union(enum) {

@@ -219,6 +219,7 @@ pub fn allTools(
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
+        memory: ?@import("../memory/root.zig").Memory = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -259,15 +260,15 @@ pub fn allTools(
 
     // Memory tools (work gracefully without a backend)
     const mst = try allocator.create(memory_store.MemoryStoreTool);
-    mst.* = .{};
+    mst.* = .{ .memory = opts.memory };
     try list.append(allocator, mst.tool());
 
     const mrt = try allocator.create(memory_recall.MemoryRecallTool);
-    mrt.* = .{};
+    mrt.* = .{ .memory = opts.memory };
     try list.append(allocator, mrt.tool());
 
     const mft = try allocator.create(memory_forget.MemoryForgetTool);
-    mft.* = .{};
+    mft.* = .{ .memory = opts.memory };
     try list.append(allocator, mft.tool());
 
     // Delegate and schedule tools

@@ -696,6 +696,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 .screenshot_enabled = true,
                 .agents = cfg.agents,
                 .fallback_api_key = cfg.defaultProviderKey(),
+                .memory = mem_opt,
             }) catch &.{};
 
             // Noop observer.
