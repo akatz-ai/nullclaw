@@ -14,6 +14,7 @@ pub const ClaudeCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
     last_session_id: ?[]const u8 = null,
+    last_error_detail: ?[]const u8 = null,
 
     const DEFAULT_MODEL = "claude-opus-4-6";
     const CLI_NAME = "claude";
@@ -31,6 +32,7 @@ pub const ClaudeCliProvider = struct {
             .allocator = allocator,
             .model = model orelse DEFAULT_MODEL,
             .last_session_id = null,
+            .last_error_detail = null,
         };
     }
 
@@ -72,6 +74,11 @@ pub const ClaudeCliProvider = struct {
         errdefer allocator.free(claude_result.content);
         defer if (claude_result.session_id) |sid| allocator.free(sid);
 
+        if (claude_result.is_error) {
+            self.updateErrorDetail(claude_result.content);
+            return classifyCliError(claude_result.content);
+        }
+
         try self.updateSessionId(claude_result.session_id);
         return claude_result.content;
     }
@@ -93,6 +100,11 @@ pub const ClaudeCliProvider = struct {
         errdefer allocator.free(claude_result.content);
         defer if (claude_result.session_id) |sid| allocator.free(sid);
 
+        if (claude_result.is_error) {
+            self.updateErrorDetail(claude_result.content);
+            return classifyCliError(claude_result.content);
+        }
+
         try self.updateSessionId(claude_result.session_id);
         const response_model = try allocator.dupe(u8, effective_model);
         return ChatResponse{ .content = claude_result.content, .model = response_model };
@@ -112,6 +124,10 @@ pub const ClaudeCliProvider = struct {
             self.allocator.free(sid);
             self.last_session_id = null;
         }
+        if (self.last_error_detail) |detail| {
+            self.allocator.free(detail);
+            self.last_error_detail = null;
+        }
     }
 
     fn updateSessionId(self: *ClaudeCliProvider, new_session_id: ?[]const u8) !void {
@@ -122,6 +138,11 @@ pub const ClaudeCliProvider = struct {
             }
             self.last_session_id = duped;
         }
+    }
+
+    fn updateErrorDetail(self: *ClaudeCliProvider, detail: []const u8) void {
+        if (self.last_error_detail) |old| self.allocator.free(old);
+        self.last_error_detail = self.allocator.dupe(u8, detail) catch null;
     }
 
     /// Run the claude CLI and parse stream-json output.
@@ -210,7 +231,11 @@ pub const ClaudeCliProvider = struct {
 
         switch (term) {
             .Exited => |code| {
-                if (code != 0) return error.CliProcessFailed;
+                if (code != 0) {
+                    const parsed_nonzero = parseStreamJson(allocator, stdout_result) catch null;
+                    if (parsed_nonzero) |result| return result;
+                    return fallbackErrorResult(allocator, stderr_state.result, code);
+                }
             },
             .Signal => |sig| {
                 if (timeout_ns > 0 and sig == std.posix.SIG.KILL) return error.CliTimeout;
@@ -221,6 +246,24 @@ pub const ClaudeCliProvider = struct {
 
         // Parse stream-json: each line is a JSON object, find type="result"
         return parseStreamJson(allocator, stdout_result);
+    }
+
+    fn fallbackErrorResult(allocator: std.mem.Allocator, stderr_output: ?[]const u8, code: u8) !ClaudeResult {
+        const trimmed = if (stderr_output) |stderr_buf|
+            std.mem.trim(u8, stderr_buf, " \t\r\n")
+        else
+            "";
+
+        const fallback_content = if (trimmed.len > 0)
+            try allocator.dupe(u8, trimmed)
+        else
+            try std.fmt.allocPrint(allocator, "claude exited with code {}", .{code});
+
+        return ClaudeResult{
+            .content = fallback_content,
+            .session_id = null,
+            .is_error = true,
+        };
     }
 
     fn timeoutNsFromSecs(timeout_secs: u64) u64 {
@@ -279,6 +322,14 @@ pub const ClaudeCliProvider = struct {
         try checkCliVersion(allocator, CLI_NAME);
     }
 };
+
+fn classifyCliError(message: []const u8) anyerror {
+    if (std.mem.indexOf(u8, message, "Not logged in") != null) return error.CliAuthError;
+    if (std.mem.indexOf(u8, message, "issue with the selected model") != null) return error.CliModelError;
+    if (std.mem.indexOf(u8, message, "Input must be provided") != null) return error.CliInputError;
+    if (std.mem.indexOf(u8, message, "cannot be launched inside another") != null) return error.CliNestedSession;
+    return error.CliErrorResponse;
+}
 
 const StderrReader = struct {
     const State = struct {
@@ -484,6 +535,58 @@ test "parseStreamJson extracts is_error field" {
 
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("invalid model", result.content);
+}
+
+test "parseStreamJson handles non-zero-exit error JSON payload" {
+    const input =
+        \\{"type":"result","is_error":true,"result":"There's an issue with the selected model (bad-model). It may not exist or you may not have access to it."}
+    ;
+    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(
+        "There's an issue with the selected model (bad-model). It may not exist or you may not have access to it.",
+        result.content,
+    );
+}
+
+test "classifyCliError returns specific typed errors" {
+    try std.testing.expectEqual(
+        error.CliAuthError,
+        classifyCliError("Not logged in · Please run /login"),
+    );
+    try std.testing.expectEqual(
+        error.CliModelError,
+        classifyCliError("There's an issue with the selected model (bad-model). It may not exist."),
+    );
+    try std.testing.expectEqual(
+        error.CliInputError,
+        classifyCliError("Error: Input must be provided either through stdin or as a prompt argument when using --print"),
+    );
+    try std.testing.expectEqual(
+        error.CliNestedSession,
+        classifyCliError("Error: Claude Code cannot be launched inside another Claude Code session."),
+    );
+    try std.testing.expectEqual(
+        error.CliErrorResponse,
+        classifyCliError("some unknown Claude CLI failure"),
+    );
+}
+
+test "fallbackErrorResult builds stderr-based ClaudeResult" {
+    const stderr_text = "  Error: Input must be provided either through stdin or as a prompt argument when using --print  \n";
+    const result = try ClaudeCliProvider.fallbackErrorResult(std.testing.allocator, stderr_text, 1);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(result.session_id == null);
+    try std.testing.expectEqualStrings(
+        "Error: Input must be provided either through stdin or as a prompt argument when using --print",
+        result.content,
+    );
 }
 
 test "ClaudeResult defaults are correct" {
