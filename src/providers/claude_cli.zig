@@ -17,7 +17,7 @@ pub const ClaudeCliProvider = struct {
 
     const DEFAULT_MODEL = "claude-opus-4-6";
     const CLI_NAME = "claude";
-    const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
+    const TIMEOUT_NS: u64 = 300 * std.time.ns_per_s;
     const ClaudeResult = struct {
         content: []const u8,
         session_id: ?[]const u8 = null,
@@ -68,7 +68,7 @@ pub const ClaudeCliProvider = struct {
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id);
+        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id, TIMEOUT_NS);
         errdefer allocator.free(claude_result.content);
         defer if (claude_result.session_id) |sid| allocator.free(sid);
 
@@ -88,7 +88,8 @@ pub const ClaudeCliProvider = struct {
 
         // Extract last user message as prompt
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id);
+        const timeout_ns = timeoutNsFromSecs(request.timeout_secs);
+        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id, timeout_ns);
         errdefer allocator.free(claude_result.content);
         defer if (claude_result.session_id) |sid| allocator.free(sid);
 
@@ -129,6 +130,7 @@ pub const ClaudeCliProvider = struct {
         prompt: []const u8,
         model: []const u8,
         resume_session_id: ?[]const u8,
+        timeout_ns: u64,
     ) !ClaudeResult {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(allocator);
@@ -152,7 +154,43 @@ pub const ClaudeCliProvider = struct {
 
         try child.spawn();
 
-        // Read all stdout
+        var watchdog_state = WatchdogState{};
+        var watchdog_thread: ?std.Thread = null;
+        var watchdog_joined = false;
+        if (timeout_ns > 0) {
+            watchdog_thread = std.Thread.spawn(.{}, Watchdog.watch, .{ &watchdog_state, child.id, timeout_ns }) catch |err| {
+                std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
+                _ = child.wait() catch {};
+                return err;
+            };
+        }
+        defer {
+            watchdog_state.stop.store(true, .release);
+            if (!watchdog_joined) {
+                if (watchdog_thread) |wt| {
+                    wt.join();
+                }
+            }
+        }
+
+        var stderr_state = StderrReader.State{
+            .stderr_pipe = child.stderr.?,
+            .allocator = allocator,
+        };
+        const stderr_thread = std.Thread.spawn(.{}, StderrReader.readStderr, .{&stderr_state}) catch |err| {
+            std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
+            _ = child.wait() catch {};
+            return err;
+        };
+        var stderr_joined = false;
+        defer {
+            if (!stderr_joined) {
+                stderr_thread.join();
+            }
+            if (stderr_state.result) |stderr_buf| allocator.free(stderr_buf);
+        }
+
+        // Read all stdout while stderr is read concurrently by stderr_thread.
         const max_output: usize = 4 * 1024 * 1024; // 4 MB
         const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
             _ = child.wait() catch {};
@@ -160,16 +198,34 @@ pub const ClaudeCliProvider = struct {
         };
         defer allocator.free(stdout_result);
 
+        stderr_thread.join();
+        stderr_joined = true;
+
         const term = try child.wait();
+        watchdog_state.stop.store(true, .release);
+        if (watchdog_thread) |wt| {
+            wt.join();
+        }
+        watchdog_joined = true;
+
         switch (term) {
             .Exited => |code| {
                 if (code != 0) return error.CliProcessFailed;
+            },
+            .Signal => |sig| {
+                if (timeout_ns > 0 and sig == std.posix.SIG.KILL) return error.CliTimeout;
+                return error.CliProcessFailed;
             },
             else => return error.CliProcessFailed,
         }
 
         // Parse stream-json: each line is a JSON object, find type="result"
         return parseStreamJson(allocator, stdout_result);
+    }
+
+    fn timeoutNsFromSecs(timeout_secs: u64) u64 {
+        if (timeout_secs == 0) return TIMEOUT_NS;
+        return std.math.mul(u64, timeout_secs, std.time.ns_per_s) catch std.math.maxInt(u64);
     }
 
     /// Parse claude stream-json output lines for a result event.
@@ -221,6 +277,41 @@ pub const ClaudeCliProvider = struct {
     /// Health check: run `claude --version` and verify exit code 0.
     pub fn healthCheck(allocator: std.mem.Allocator) !void {
         try checkCliVersion(allocator, CLI_NAME);
+    }
+};
+
+const StderrReader = struct {
+    const State = struct {
+        stderr_pipe: std.fs.File,
+        allocator: std.mem.Allocator,
+        result: ?[]u8 = null,
+    };
+
+    fn readStderr(state: *State) void {
+        state.result = state.stderr_pipe.readToEndAlloc(state.allocator, 64 * 1024) catch null;
+    }
+};
+
+const WatchdogState = struct {
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+const Watchdog = struct {
+    fn watch(state: *WatchdogState, pid: std.posix.pid_t, timeout_ns: u64) void {
+        const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
+        var elapsed_ns: u64 = 0;
+
+        while (elapsed_ns < timeout_ns) {
+            if (state.stop.load(.acquire)) return;
+
+            const remaining_ns = timeout_ns - elapsed_ns;
+            const sleep_ns = @min(poll_interval_ns, remaining_ns);
+            std.Thread.sleep(sleep_ns);
+            elapsed_ns += sleep_ns;
+        }
+
+        if (state.stop.load(.acquire)) return;
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     }
 };
 
@@ -419,3 +510,22 @@ test "ClaudeCliProvider.init returns CliNotFound for missing binary" {
 test "ClaudeCliProvider default model is claude-opus-4-6" {
     try std.testing.expectEqualStrings("claude-opus-4-6", ClaudeCliProvider.DEFAULT_MODEL);
 }
+
+test "runClaude return type accepts CliTimeout error" {
+    const ReturnType = @typeInfo(@TypeOf(ClaudeCliProvider.runClaude)).@"fn".return_type.?;
+    const result: ReturnType = error.CliTimeout;
+    try std.testing.expectError(error.CliTimeout, result);
+}
+
+test "timeoutNsFromSecs converts seconds to nanoseconds" {
+    const timeout_ns = ClaudeCliProvider.timeoutNsFromSecs(5);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), timeout_ns);
+}
+
+test "timeoutNsFromSecs falls back to default when timeout is zero" {
+    const timeout_ns = ClaudeCliProvider.timeoutNsFromSecs(0);
+    try std.testing.expectEqual(ClaudeCliProvider.TIMEOUT_NS, timeout_ns);
+}
+
+// Integration timeout/deadlock behavior requires spawning intentionally slow processes and is
+// better covered in end-to-end tests.
