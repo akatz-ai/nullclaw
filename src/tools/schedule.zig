@@ -34,13 +34,81 @@ pub const ScheduleTool = struct {
     }
 
     fn vtableDesc(_: *anyopaque) []const u8 {
-        return "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume";
+        return "Manage scheduled tasks. Supports shell commands and agent wake prompts. Actions: create/add/once/list/get/cancel/remove/pause/resume";
     }
 
     fn vtableParams(_: *anyopaque) []const u8 {
         return 
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"job_type":{"type":"string","enum":["shell","agent"],"default":"shell","description":"Job kind: shell command or agent wake prompt"},"command":{"type":"string","description":"Shell command to execute (required for shell jobs)"},"prompt":{"type":"string","description":"Agent prompt to process when job_type is 'agent'"},"delivery":{"type":"object","description":"Optional delivery routing for scheduled output","properties":{"mode":{"type":"string","enum":["none","always","on_error","on_success"],"default":"none"},"channel":{"type":"string","description":"Target channel name (e.g. telegram)"},"to":{"type":"string","description":"Target chat/user/room id"}}},"id":{"type":"string","description":"Task ID"}},"required":["action"]}
         ;
+    }
+
+    const ParseJobTypeError = error{InvalidJobType};
+    const ParseDeliveryError = error{
+        DeliveryMustBeObject,
+        DeliveryModeMustBeString,
+        InvalidDeliveryMode,
+        DeliveryChannelMustBeString,
+        DeliveryToMustBeString,
+    };
+
+    fn parseJobType(args: JsonObjectMap) ParseJobTypeError!cron.JobType {
+        const raw = root.getString(args, "job_type") orelse return .shell;
+        if (std.ascii.eqlIgnoreCase(raw, "shell")) return .shell;
+        if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
+        return error.InvalidJobType;
+    }
+
+    fn isValidDeliveryMode(raw: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(raw, "none") or
+            std.ascii.eqlIgnoreCase(raw, "always") or
+            std.ascii.eqlIgnoreCase(raw, "on_error") or
+            std.ascii.eqlIgnoreCase(raw, "on_success");
+    }
+
+    fn parseDelivery(args: JsonObjectMap) ParseDeliveryError!cron.DeliveryConfig {
+        var delivery: cron.DeliveryConfig = .{};
+        const value = root.getValue(args, "delivery") orelse return delivery;
+        if (value != .object) return error.DeliveryMustBeObject;
+
+        const obj = value.object;
+        if (obj.get("mode")) |mv| {
+            const mode_str = switch (mv) {
+                .string => |s| s,
+                else => return error.DeliveryModeMustBeString,
+            };
+            if (!isValidDeliveryMode(mode_str)) return error.InvalidDeliveryMode;
+            delivery.mode = cron.DeliveryMode.parse(mode_str);
+        }
+        if (obj.get("channel")) |cv| {
+            delivery.channel = switch (cv) {
+                .string => |s| s,
+                else => return error.DeliveryChannelMustBeString,
+            };
+        }
+        if (obj.get("to")) |tv| {
+            delivery.to = switch (tv) {
+                .string => |s| s,
+                else => return error.DeliveryToMustBeString,
+            };
+        }
+        if (obj.get("best_effort")) |bv| {
+            if (bv == .bool) delivery.best_effort = bv.bool;
+        }
+        return delivery;
+    }
+
+    fn setJobDelivery(allocator: std.mem.Allocator, job: *cron.CronJob, delivery: cron.DeliveryConfig) !void {
+        const channel_copy = if (delivery.channel) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (channel_copy) |c| allocator.free(c);
+        const to_copy = if (delivery.to) |t| try allocator.dupe(u8, t) else null;
+
+        job.delivery = .{
+            .mode = delivery.mode,
+            .channel = channel_copy,
+            .to = to_copy,
+            .best_effort = delivery.best_effort,
+        };
     }
 
     fn execute(_: *ScheduleTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -71,12 +139,16 @@ pub const ScheduleTool = struct {
                     break :blk "";
                 };
                 const status = job.last_status orelse "pending";
-                try w.print("- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
+                const primary = if (job.job_type == .agent) (job.prompt orelse job.command) else job.command;
+                const primary_label = if (job.job_type == .agent) "prompt" else "cmd";
+                try w.print("- {s} | {s} | type={s} | status={s}{s} | {s}: {s}\n", .{
                     job.id,
                     job.expression,
+                    job.job_type.asStr(),
                     status,
                     flags,
-                    job.command,
+                    primary_label,
+                    primary,
                 });
             }
             return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
@@ -100,13 +172,17 @@ pub const ScheduleTool = struct {
                     break :blk "";
                 };
                 const status = job.last_status orelse "pending";
-                const msg = try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s}\n  cmd: {s}", .{
+                const primary = if (job.job_type == .agent) (job.prompt orelse job.command) else job.command;
+                const primary_label = if (job.job_type == .agent) "prompt" else "cmd";
+                const msg = try std.fmt.allocPrint(allocator, "Job {s} | {s} | type={s} | next={d} | status={s}{s}\n  {s}: {s}", .{
                     job.id,
                     job.expression,
+                    job.job_type.asStr(),
                     job.next_run_secs,
                     status,
                     flags,
-                    job.command,
+                    primary_label,
+                    primary,
                 });
                 return ToolResult{ .success = true, .output = msg };
             }
@@ -115,53 +191,117 @@ pub const ScheduleTool = struct {
         }
 
         if (std.mem.eql(u8, action, "create") or std.mem.eql(u8, action, "add")) {
-            const command = root.getString(args, "command") orelse
-                return ToolResult.fail("Missing 'command' parameter");
+            const job_type = parseJobType(args) catch
+                return ToolResult.fail("Invalid 'job_type' parameter (expected 'shell' or 'agent')");
+            const delivery = parseDelivery(args) catch |err| switch (err) {
+                error.DeliveryMustBeObject => return ToolResult.fail("Parameter 'delivery' must be an object"),
+                error.DeliveryModeMustBeString => return ToolResult.fail("'delivery.mode' must be a string"),
+                error.InvalidDeliveryMode => return ToolResult.fail("Invalid delivery.mode (expected none|always|on_error|on_success)"),
+                error.DeliveryChannelMustBeString => return ToolResult.fail("'delivery.channel' must be a string"),
+                error.DeliveryToMustBeString => return ToolResult.fail("'delivery.to' must be a string"),
+            };
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
+            const prompt = root.getString(args, "prompt");
+            const command = root.getString(args, "command");
+
+            const primary_input = switch (job_type) {
+                .shell => command orelse return ToolResult.fail("Missing 'command' parameter"),
+                .agent => prompt orelse return ToolResult.fail("Missing 'prompt' parameter for agent job"),
+            };
+
+            if (job_type == .agent and delivery.mode != .none and delivery.channel == null) {
+                return ToolResult.fail("Agent jobs with delivery mode require delivery.channel");
+            }
 
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addJob(expression, command) catch |err| {
+            const job = scheduler.addJob(expression, primary_input) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
+            if (job_type == .agent) {
+                job.job_type = .agent;
+                job.prompt = allocator.dupe(u8, primary_input) catch {
+                    return ToolResult.fail("Failed to store agent prompt");
+                };
+                if (delivery.channel != null and delivery.to != null) {
+                    job.session_target = .main;
+                }
+            }
+            setJobDelivery(allocator, job, delivery) catch {
+                return ToolResult.fail("Failed to store delivery config");
+            };
+
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
+            const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | type={s} | input: {s}", .{
                 job.id,
                 job.expression,
-                job.command,
+                job.job_type.asStr(),
+                primary_input,
             });
             return ToolResult{ .success = true, .output = msg };
         }
 
         if (std.mem.eql(u8, action, "once")) {
-            const command = root.getString(args, "command") orelse
-                return ToolResult.fail("Missing 'command' parameter");
+            const job_type = parseJobType(args) catch
+                return ToolResult.fail("Invalid 'job_type' parameter (expected 'shell' or 'agent')");
+            const delivery = parseDelivery(args) catch |err| switch (err) {
+                error.DeliveryMustBeObject => return ToolResult.fail("Parameter 'delivery' must be an object"),
+                error.DeliveryModeMustBeString => return ToolResult.fail("'delivery.mode' must be a string"),
+                error.InvalidDeliveryMode => return ToolResult.fail("Invalid delivery.mode (expected none|always|on_error|on_success)"),
+                error.DeliveryChannelMustBeString => return ToolResult.fail("'delivery.channel' must be a string"),
+                error.DeliveryToMustBeString => return ToolResult.fail("'delivery.to' must be a string"),
+            };
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
+            const prompt = root.getString(args, "prompt");
+            const command = root.getString(args, "command");
+
+            const primary_input = switch (job_type) {
+                .shell => command orelse return ToolResult.fail("Missing 'command' parameter"),
+                .agent => prompt orelse return ToolResult.fail("Missing 'prompt' parameter for agent job"),
+            };
+
+            if (job_type == .agent and delivery.mode != .none and delivery.channel == null) {
+                return ToolResult.fail("Agent jobs with delivery mode require delivery.channel");
+            }
 
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addOnce(delay, command) catch |err| {
+            const job = scheduler.addOnce(delay, primary_input) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
+            if (job_type == .agent) {
+                job.job_type = .agent;
+                job.prompt = allocator.dupe(u8, primary_input) catch {
+                    return ToolResult.fail("Failed to store agent prompt");
+                };
+                if (delivery.channel != null and delivery.to != null) {
+                    job.session_target = .main;
+                }
+            }
+            setJobDelivery(allocator, job, delivery) catch {
+                return ToolResult.fail("Failed to store delivery config");
+            };
+
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
+            const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | type={s} | input: {s}", .{
                 job.id,
                 job.next_run_secs,
-                job.command,
+                job.job_type.asStr(),
+                primary_input,
             });
             return ToolResult{ .success = true, .output = msg };
         }
@@ -224,6 +364,9 @@ test "schedule schema has action" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "action") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "job_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "delivery") != null);
 }
 
 test "schedule list returns success" {
@@ -259,6 +402,18 @@ test "schedule create with expression" {
     // Succeeds if HOME/.nullclaw is writable, otherwise may fail gracefully
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
+    }
+}
+
+test "schedule create agent job with prompt" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"job_type\": \"agent\", \"expression\": \"*/30 * * * *\", \"prompt\": \"summarize logs\", \"delivery\": {\"mode\": \"always\", \"channel\": \"telegram\", \"to\": \"chat-1\"}}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    if (result.success) {
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "type=agent") != null);
     }
 }
 
@@ -389,6 +544,16 @@ test "schedule create missing command" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "command") != null);
+}
+
+test "schedule create agent missing prompt" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"job_type\": \"agent\", \"expression\": \"* * * * *\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "prompt") != null);
 }
 
 test "schedule create missing expression" {

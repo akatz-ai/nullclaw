@@ -16,6 +16,7 @@ const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
+const bus_mod = @import("bus.zig");
 
 const log = std.log.scoped(.channel_loop);
 
@@ -294,6 +295,34 @@ pub fn runTelegramLoop(
         }
 
         health.markComponentOk("telegram");
+    }
+}
+
+/// Inbound processor loop — consumes inbound bus messages, runs them through
+/// SessionManager, and republishes responses on outbound bus for channel delivery.
+pub fn runInboundProcessor(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    runtime: *ChannelRuntime,
+) void {
+    while (event_bus.consumeInbound()) |msg| {
+        defer msg.deinit(allocator);
+
+        const reply = runtime.session_mgr.processMessage(msg.session_key, msg.content) catch |err| {
+            log.err("Inbound processing failed: {}", .{err});
+            const err_text = "Scheduled task failed to process.";
+            const out_err = bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_text) catch continue;
+            event_bus.publishOutbound(out_err) catch {
+                out_err.deinit(allocator);
+            };
+            continue;
+        };
+        defer allocator.free(reply);
+
+        const out = bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply) catch continue;
+        event_bus.publishOutbound(out) catch {
+            out.deinit(allocator);
+        };
     }
 }
 

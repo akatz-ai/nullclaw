@@ -446,6 +446,18 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
     defer if (channel_rt) |rt| rt.deinit();
 
+    // Inbound processor (bus inbound -> SessionManager -> bus outbound)
+    var inbound_thread: ?std.Thread = null;
+    if (channel_rt) |rt| {
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, channel_loop.runInboundProcessor, .{
+            allocator, &event_bus, rt,
+        })) |thread| {
+            inbound_thread = thread;
+        } else |err| {
+            stdout.print("Warning: inbound processor thread failed: {}\n", .{err}) catch {};
+        }
+    }
+
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
     if (hasSupervisedChannels(config)) {
@@ -490,6 +502,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Wait for threads
     if (dispatcher_thread) |t| t.join();
+    if (inbound_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();

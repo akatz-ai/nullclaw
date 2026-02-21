@@ -118,6 +118,55 @@ pub const CronJob = struct {
     delivery: DeliveryConfig = .{},
 };
 
+fn freeJobOwnedStrings(allocator: std.mem.Allocator, job: CronJob) void {
+    allocator.free(job.id);
+    allocator.free(job.expression);
+    allocator.free(job.command);
+    if (job.prompt) |p| allocator.free(p);
+    if (job.name) |n| allocator.free(n);
+    if (job.model) |m| allocator.free(m);
+    if (job.last_output) |o| allocator.free(o);
+    if (job.delivery.channel) |c| allocator.free(c);
+    if (job.delivery.to) |t| allocator.free(t);
+}
+
+fn makeAgentSessionKey(
+    allocator: std.mem.Allocator,
+    job: *const CronJob,
+    channel: []const u8,
+    chat_id: []const u8,
+) ![]const u8 {
+    if (job.session_target == .main and job.delivery.channel != null and job.delivery.to != null) {
+        return std.fmt.allocPrint(allocator, "{s}:{s}", .{ channel, chat_id });
+    }
+    return std.fmt.allocPrint(allocator, "cron:{s}", .{job.id});
+}
+
+fn publishAgentWake(
+    allocator: std.mem.Allocator,
+    job: *const CronJob,
+    prompt: []const u8,
+    out_bus: *bus.Bus,
+) !void {
+    const channel = job.delivery.channel orelse "system";
+    const chat_id = job.delivery.to orelse "default";
+    const session_key = try makeAgentSessionKey(allocator, job, channel, chat_id);
+    defer allocator.free(session_key);
+
+    const inbound = try bus.makeInbound(
+        allocator,
+        channel,
+        "scheduler",
+        chat_id,
+        prompt,
+        session_key,
+    );
+    out_bus.publishInbound(inbound) catch |err| {
+        inbound.deinit(allocator);
+        return err;
+    };
+}
+
 /// Duration unit for "once" delay parsing.
 pub const DurationUnit = enum {
     seconds,
@@ -216,10 +265,7 @@ pub const CronScheduler = struct {
         }
         self.runs.deinit(self.allocator);
         for (self.jobs.items) |job| {
-            self.allocator.free(job.id);
-            self.allocator.free(job.expression);
-            self.allocator.free(job.command);
-            if (job.last_output) |o| self.allocator.free(o);
+            freeJobOwnedStrings(self.allocator, job);
         }
         self.jobs.deinit(self.allocator);
     }
@@ -240,6 +286,7 @@ pub const CronScheduler = struct {
             .expression = try self.allocator.dupe(u8, expression),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = std.time.timestamp() + 60, // placeholder
+            .created_at_s = std.time.timestamp(),
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -264,6 +311,7 @@ pub const CronScheduler = struct {
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = now + delay_secs,
             .one_shot = true,
+            .created_at_s = now,
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -300,6 +348,18 @@ pub const CronScheduler = struct {
         if (patch.command) |cmd| {
             allocator.free(job.command);
             job.command = allocator.dupe(u8, cmd) catch return false;
+        }
+        if (patch.prompt) |p| {
+            if (job.prompt) |old| allocator.free(old);
+            job.prompt = allocator.dupe(u8, p) catch return false;
+        }
+        if (patch.name) |n| {
+            if (job.name) |old| allocator.free(old);
+            job.name = allocator.dupe(u8, n) catch return false;
+        }
+        if (patch.model) |m| {
+            if (job.model) |old| allocator.free(old);
+            job.model = allocator.dupe(u8, m) catch return false;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -366,9 +426,7 @@ pub const CronScheduler = struct {
     pub fn removeJob(self: *CronScheduler, id: []const u8) bool {
         for (self.jobs.items, 0..) |job, i| {
             if (std.mem.eql(u8, job.id, id)) {
-                self.allocator.free(job.id);
-                self.allocator.free(job.expression);
-                self.allocator.free(job.command);
+                freeJobOwnedStrings(self.allocator, job);
                 _ = self.jobs.orderedRemove(i);
                 return true;
             }
@@ -472,18 +530,29 @@ pub const CronScheduler = struct {
                     }
                 },
                 .agent => {
-                    // Agent jobs: use prompt or command as the agent input.
-                    // In the real runtime the agent turn produces a result;
-                    // here we record the prompt and treat it as the output placeholder.
-                    const agent_output = job.prompt orelse job.command;
+                    const agent_prompt = job.prompt orelse job.command;
                     job.last_run_secs = now;
-                    job.last_status = "ok";
+                    if (agent_prompt.len == 0) {
+                        job.last_status = "error";
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, "empty agent prompt") catch null;
+                        continue;
+                    }
 
                     if (job.last_output) |old| self.allocator.free(old);
-                    job.last_output = self.allocator.dupe(u8, agent_output) catch null;
-
                     if (out_bus) |b| {
-                        _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                        publishAgentWake(self.allocator, job, agent_prompt, b) catch |err| {
+                            log.err("cron agent wake publish failed for '{s}': {}", .{ job.id, err });
+                            job.last_status = "error";
+                            job.last_output = self.allocator.dupe(u8, "agent wake publish failed") catch null;
+                            continue;
+                        };
+                        job.last_status = "queued";
+                        job.last_output = self.allocator.dupe(u8, agent_prompt) catch null;
+                    } else {
+                        // Fallback path when no bus is available.
+                        job.last_status = "ok";
+                        job.last_output = self.allocator.dupe(u8, agent_prompt) catch null;
                     }
                 },
             }
@@ -509,10 +578,7 @@ pub const CronScheduler = struct {
                 i -= 1;
                 const rm_idx = remove_indices[i];
                 const job = self.jobs.items[rm_idx];
-                self.allocator.free(job.id);
-                self.allocator.free(job.expression);
-                self.allocator.free(job.command);
-                if (job.last_output) |o| self.allocator.free(o);
+                freeJobOwnedStrings(self.allocator, job);
                 _ = self.jobs.orderedRemove(rm_idx);
             }
         }
@@ -613,6 +679,26 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try w.print("\"id\":\"{s}\",", .{job.id});
         try w.print("\"expression\":\"{s}\",", .{job.expression});
         try w.print("\"command\":\"{s}\",", .{job.command});
+        try w.print("\"job_type\":\"{s}\",", .{job.job_type.asStr()});
+        try w.print("\"session_target\":\"{s}\",", .{job.session_target.asStr()});
+        if (job.prompt) |p| {
+            try w.print("\"prompt\":\"{s}\",", .{p});
+        } else {
+            try w.writeAll("\"prompt\":null,");
+        }
+        if (job.name) |n| {
+            try w.print("\"name\":\"{s}\",", .{n});
+        } else {
+            try w.writeAll("\"name\":null,");
+        }
+        if (job.model) |m| {
+            try w.print("\"model\":\"{s}\",", .{m});
+        } else {
+            try w.writeAll("\"model\":null,");
+        }
+        try w.print("\"enabled\":{s},", .{if (job.enabled) "true" else "false"});
+        try w.print("\"delete_after_run\":{s},", .{if (job.delete_after_run) "true" else "false"});
+        try w.print("\"created_at_s\":{d},", .{job.created_at_s});
         try w.print("\"next_run_secs\":{d},", .{job.next_run_secs});
         if (job.last_run_secs) |lrs| {
             try w.print("\"last_run_secs\":{d},", .{lrs});
@@ -625,7 +711,26 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
             try w.writeAll("\"last_status\":null,");
         }
         try w.print("\"paused\":{s},", .{if (job.paused) "true" else "false"});
-        try w.print("\"one_shot\":{s}", .{if (job.one_shot) "true" else "false"});
+        try w.print("\"one_shot\":{s},", .{if (job.one_shot) "true" else "false"});
+        if (job.last_output) |o| {
+            try w.print("\"last_output\":\"{s}\",", .{o});
+        } else {
+            try w.writeAll("\"last_output\":null,");
+        }
+        try w.writeAll("\"delivery\":{");
+        try w.print("\"mode\":\"{s}\",", .{job.delivery.mode.asStr()});
+        if (job.delivery.channel) |c| {
+            try w.print("\"channel\":\"{s}\",", .{c});
+        } else {
+            try w.writeAll("\"channel\":null,");
+        }
+        if (job.delivery.to) |t| {
+            try w.print("\"to\":\"{s}\",", .{t});
+        } else {
+            try w.writeAll("\"to\":null,");
+        }
+        try w.print("\"best_effort\":{s}", .{if (job.delivery.best_effort) "true" else "false"});
+        try w.writeAll("}");
         try w.writeAll("}");
         if (i + 1 < scheduler.jobs.items.len) {
             try w.writeAll(",");
@@ -671,6 +776,60 @@ pub fn loadJobs(scheduler: *CronScheduler) !void {
             }
             continue;
         };
+        const job_type = blk: {
+            if (obj.get("job_type")) |v| {
+                if (v == .string) break :blk JobType.parse(v.string);
+            }
+            break :blk JobType.shell;
+        };
+        const session_target = blk: {
+            if (obj.get("session_target")) |v| {
+                if (v == .string) break :blk SessionTarget.parse(v.string);
+            }
+            break :blk SessionTarget.isolated;
+        };
+        const prompt: ?[]const u8 = blk: {
+            if (obj.get("prompt")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const name: ?[]const u8 = blk: {
+            if (obj.get("name")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const model: ?[]const u8 = blk: {
+            if (obj.get("model")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const enabled = blk: {
+            if (obj.get("enabled")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
+        const delete_after_run = blk: {
+            if (obj.get("delete_after_run")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+        const created_at_s: i64 = blk: {
+            if (obj.get("created_at_s")) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            break :blk std.time.timestamp();
+        };
+        const last_output: ?[]const u8 = blk: {
+            if (obj.get("last_output")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
 
         const next_run_secs: i64 = blk: {
             if (obj.get("next_run_secs")) |v| {
@@ -693,13 +852,47 @@ pub fn loadJobs(scheduler: *CronScheduler) !void {
             break :blk false;
         };
 
+        var delivery = DeliveryConfig{};
+        if (obj.get("delivery")) |dv| {
+            if (dv == .object) {
+                const dobj = dv.object;
+                if (dobj.get("mode")) |mv| {
+                    if (mv == .string) delivery.mode = DeliveryMode.parse(mv.string);
+                }
+                if (dobj.get("channel")) |cv| {
+                    if (cv == .string) delivery.channel = cv.string;
+                }
+                if (dobj.get("to")) |tv| {
+                    if (tv == .string) delivery.to = tv.string;
+                }
+                if (dobj.get("best_effort")) |bv| {
+                    if (bv == .bool) delivery.best_effort = bv.bool;
+                }
+            }
+        }
+
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
             .expression = try scheduler.allocator.dupe(u8, expression),
             .command = try scheduler.allocator.dupe(u8, command),
+            .job_type = job_type,
+            .session_target = session_target,
+            .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
+            .name = if (name) |n| try scheduler.allocator.dupe(u8, n) else null,
+            .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .enabled = enabled,
+            .delete_after_run = delete_after_run,
+            .created_at_s = created_at_s,
             .next_run_secs = next_run_secs,
             .paused = paused,
             .one_shot = one_shot,
+            .last_output = if (last_output) |o| try scheduler.allocator.dupe(u8, o) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try scheduler.allocator.dupe(u8, c) else null,
+                .to = if (delivery.to) |t| try scheduler.allocator.dupe(u8, t) else null,
+                .best_effort = delivery.best_effort,
+            },
         });
     }
 }
@@ -1305,8 +1498,8 @@ test "shell job delivers stdout via bus" {
     // Configure delivery
     scheduler.jobs.items[0].delivery = .{
         .mode = .always,
-        .channel = "telegram",
-        .to = "chat99",
+        .channel = try allocator.dupe(u8, "telegram"),
+        .to = try allocator.dupe(u8, "chat99"),
     };
     scheduler.jobs.items[0].next_run_secs = 0;
 
@@ -1322,7 +1515,7 @@ test "shell job delivers stdout via bus" {
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "hello_cron") != null);
 }
 
-test "agent job delivers result via bus" {
+test "agent job publishes wake message to inbound bus" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
@@ -1336,23 +1529,26 @@ test "agent job delivers result via bus" {
         .expression = try allocator.dupe(u8, "* * * * *"),
         .command = try allocator.dupe(u8, "summarize"),
         .job_type = .agent,
-        .prompt = "Summarize today's news",
+        .session_target = .main,
+        .prompt = try allocator.dupe(u8, "Summarize today's news"),
         .next_run_secs = 0,
         .delivery = .{
             .mode = .always,
-            .channel = "discord",
-            .to = "general",
+            .channel = try allocator.dupe(u8, "discord"),
+            .to = try allocator.dupe(u8, "general"),
         },
     });
 
     scheduler.tick(std.time.timestamp(), &test_bus);
 
-    // Verify delivery
-    try std.testing.expect(test_bus.outboundDepth() > 0);
-    var msg = test_bus.consumeOutbound().?;
+    // Verify wake event
+    try std.testing.expect(test_bus.inboundDepth() > 0);
+    var msg = test_bus.consumeInbound().?;
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("scheduler", msg.sender_id);
     try std.testing.expectEqualStrings("general", msg.chat_id);
+    try std.testing.expectEqualStrings("discord:general", msg.session_key);
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
 }
 

@@ -677,6 +677,43 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 // ── Channel Start (Telegram bot loop) ────────────────────────────
 
+fn channelSchedulerThread(
+    allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
+    event_bus: *yc.bus.Bus,
+) void {
+    var scheduler = yc.cron.CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    defer scheduler.deinit();
+
+    yc.cron.loadJobs(&scheduler) catch {};
+    scheduler.run(config.reliability.scheduler_poll_secs, event_bus);
+}
+
+fn inboundProcessorThread(
+    allocator: std.mem.Allocator,
+    event_bus: *yc.bus.Bus,
+    session_mgr: *yc.session.SessionManager,
+) void {
+    while (event_bus.consumeInbound()) |msg| {
+        defer msg.deinit(allocator);
+
+        const reply = session_mgr.processMessage(msg.session_key, msg.content) catch {
+            const err_text = "Scheduled task failed to process.";
+            const out_err = yc.bus.makeOutbound(allocator, msg.channel, msg.chat_id, err_text) catch continue;
+            event_bus.publishOutbound(out_err) catch {
+                out_err.deinit(allocator);
+            };
+            continue;
+        };
+        defer allocator.free(reply);
+
+        const out = yc.bus.makeOutbound(allocator, msg.channel, msg.chat_id, reply) catch continue;
+        event_bus.publishOutbound(out) catch {
+            out.deinit(allocator);
+        };
+    }
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Load config
     var config = yc.config.Config.load(allocator) catch {
@@ -737,6 +774,34 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
 
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
     tg.proxy = telegram_config.proxy;
+
+    // Event bus + outbound dispatch for scheduled jobs.
+    var event_bus = yc.bus.Bus.init();
+    var channel_registry = yc.channels.dispatch.ChannelRegistry.init(allocator);
+    defer channel_registry.deinit();
+
+    var dispatch_stats = yc.channels.dispatch.DispatchStats{};
+
+    // Use a dedicated channel instance for outbound dispatch thread safety.
+    var tg_dispatch = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
+    tg_dispatch.proxy = telegram_config.proxy;
+    channel_registry.register(tg_dispatch.channel()) catch |err| {
+        std.debug.print("  Warning: failed to register telegram dispatcher channel: {}\n", .{err});
+    };
+
+    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, yc.channels.dispatch.runOutboundDispatcher, .{
+        allocator, &event_bus, &channel_registry, &dispatch_stats,
+    })) |_| {} else |err| {
+        std.debug.print("  Warning: failed to start outbound dispatcher: {}\n", .{err});
+    }
+
+    if (config.scheduler.enabled) {
+        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSchedulerThread, .{
+            allocator, &config, &event_bus,
+        })) |_| {} else |err| {
+            std.debug.print("  Warning: scheduler thread failed: {}\n", .{err});
+        }
+    }
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
@@ -840,6 +905,12 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
 
     var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
     defer session_mgr.deinit();
+
+    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundProcessorThread, .{
+        allocator, &event_bus, &session_mgr,
+    })) |_| {} else |err| {
+        std.debug.print("  Warning: inbound processor thread failed: {}\n", .{err});
+    }
 
     var typing = yc.channels.telegram.TypingIndicator.init(&tg);
     var evict_counter: u32 = 0;
