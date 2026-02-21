@@ -710,7 +710,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (config.defaultProviderKey() == null and provider_kind != .openai_codex_provider) {
+    if (config.defaultProviderKey() == null and provider_kind != .openai_codex_provider and provider_kind != .claude_cli_provider) {
         std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
@@ -800,6 +800,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         gemini: yc.providers.gemini.GeminiProvider,
         ollama: yc.providers.ollama.OllamaProvider,
         openai_codex: yc.providers.openai_codex.OpenAiCodexProvider,
+        claude_cli: yc.providers.claude_cli.ClaudeCliProvider,
     };
 
     const api_key = config.defaultProviderKey();
@@ -814,6 +815,8 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .{ .ollama = yc.providers.ollama.OllamaProvider.init(allocator, null) }
     else if (std.mem.eql(u8, config.default_provider, "openai-codex"))
         .{ .openai_codex = yc.providers.openai_codex.OpenAiCodexProvider.init(allocator, null) }
+    else if (std.mem.eql(u8, config.default_provider, "claude-cli"))
+        .{ .claude_cli = try yc.providers.claude_cli.ClaudeCliProvider.init(allocator, config.default_model) }
     else
         // Default: OpenRouter (also handles all other provider names)
         .{ .openrouter = yc.providers.openrouter.OpenRouterProvider.init(allocator, api_key) };
@@ -825,6 +828,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .gemini => |*p| p.provider(),
         .ollama => |*p| p.provider(),
         .openai_codex => |*p| p.provider(),
+        .claude_cli => |*p| p.provider(),
     };
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});

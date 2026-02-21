@@ -51,6 +51,7 @@ pub const ProviderHolder = union(enum) {
     ollama: providers.ollama.OllamaProvider,
     compatible: providers.compatible.OpenAiCompatibleProvider,
     openai_codex: providers.openai_codex.OpenAiCodexProvider,
+    claude_cli: providers.claude_cli.ClaudeCliProvider,
 
     pub fn provider(self: *ProviderHolder) providers.Provider {
         return switch (self.*) {
@@ -61,6 +62,7 @@ pub const ProviderHolder = union(enum) {
             .ollama => |*p| p.provider(),
             .compatible => |*p| p.provider(),
             .openai_codex => |*p| p.provider(),
+            .claude_cli => |*p| p.provider(),
         };
     }
 };
@@ -109,7 +111,8 @@ pub const ChannelRuntime = struct {
                 .bearer,
             ) },
             .openai_codex_provider => .{ .openai_codex = providers.openai_codex.OpenAiCodexProvider.init(allocator, null) },
-            .claude_cli_provider, .codex_cli_provider, .unknown => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, api_key) },
+            .claude_cli_provider => .{ .claude_cli = try providers.claude_cli.ClaudeCliProvider.init(allocator, config.default_model) },
+            .codex_cli_provider, .unknown => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, api_key) },
         };
 
         const provider_i = holder.provider();
