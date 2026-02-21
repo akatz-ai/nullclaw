@@ -13,10 +13,16 @@ const ChatMessage = root.ChatMessage;
 pub const ClaudeCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
+    last_session_id: ?[]const u8 = null,
 
     const DEFAULT_MODEL = "claude-opus-4-6";
     const CLI_NAME = "claude";
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
+    const ClaudeResult = struct {
+        content: []const u8,
+        session_id: ?[]const u8 = null,
+        is_error: bool = false,
+    };
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !ClaudeCliProvider {
         // Verify CLI is in PATH
@@ -24,6 +30,7 @@ pub const ClaudeCliProvider = struct {
         return .{
             .allocator = allocator,
             .model = model orelse DEFAULT_MODEL,
+            .last_session_id = null,
         };
     }
 
@@ -61,7 +68,12 @@ pub const ClaudeCliProvider = struct {
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        return runClaude(allocator, prompt, effective_model);
+        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id);
+        errdefer allocator.free(claude_result.content);
+        defer if (claude_result.session_id) |sid| allocator.free(sid);
+
+        try self.updateSessionId(claude_result.session_id);
+        return claude_result.content;
     }
 
     fn chatImpl(
@@ -76,8 +88,13 @@ pub const ClaudeCliProvider = struct {
 
         // Extract last user message as prompt
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try runClaude(allocator, prompt, effective_model);
-        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
+        const claude_result = try runClaude(allocator, prompt, effective_model, self.last_session_id);
+        errdefer allocator.free(claude_result.content);
+        defer if (claude_result.session_id) |sid| allocator.free(sid);
+
+        try self.updateSessionId(claude_result.session_id);
+        const response_model = try allocator.dupe(u8, effective_model);
+        return ChatResponse{ .content = claude_result.content, .model = response_model };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -88,21 +105,48 @@ pub const ClaudeCliProvider = struct {
         return "claude-cli";
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
+        if (self.last_session_id) |sid| {
+            self.allocator.free(sid);
+            self.last_session_id = null;
+        }
+    }
+
+    fn updateSessionId(self: *ClaudeCliProvider, new_session_id: ?[]const u8) !void {
+        if (new_session_id) |sid| {
+            const duped = try self.allocator.dupe(u8, sid);
+            if (self.last_session_id) |old_sid| {
+                self.allocator.free(old_sid);
+            }
+            self.last_session_id = duped;
+        }
+    }
 
     /// Run the claude CLI and parse stream-json output.
-    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
-        const argv = [_][]const u8{
+    fn runClaude(
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        model: []const u8,
+        resume_session_id: ?[]const u8,
+    ) !ClaudeResult {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(allocator);
+
+        try args.appendSlice(allocator, &.{
             CLI_NAME,
             "-p",
             prompt,
             "--output-format",
-            "stream-json",
+            "json",
             "--model",
             model,
-        };
+        });
+        if (resume_session_id) |sid| {
+            try args.appendSlice(allocator, &.{ "--resume", sid });
+        }
 
-        var child = std.process.Child.init(&argv, allocator);
+        var child = std.process.Child.init(args.items, allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
@@ -129,7 +173,7 @@ pub const ClaudeCliProvider = struct {
     }
 
     /// Parse claude stream-json output lines for a result event.
-    fn parseStreamJson(allocator: std.mem.Allocator, output: []const u8) ![]const u8 {
+    fn parseStreamJson(allocator: std.mem.Allocator, output: []const u8) !ClaudeResult {
         var lines = std.mem.splitScalar(u8, output, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -145,7 +189,27 @@ pub const ClaudeCliProvider = struct {
                 if (type_val == .string and std.mem.eql(u8, type_val.string, "result")) {
                     if (obj.get("result")) |result_val| {
                         if (result_val == .string) {
-                            return try allocator.dupe(u8, result_val.string);
+                            var session_id: ?[]const u8 = null;
+                            errdefer if (session_id) |sid| allocator.free(sid);
+
+                            if (obj.get("session_id")) |sid_val| {
+                                if (sid_val == .string) {
+                                    session_id = try allocator.dupe(u8, sid_val.string);
+                                }
+                            }
+
+                            var is_error = false;
+                            if (obj.get("is_error")) |is_error_val| {
+                                if (is_error_val == .bool) {
+                                    is_error = is_error_val.bool;
+                                }
+                            }
+
+                            return ClaudeResult{
+                                .content = try allocator.dupe(u8, result_val.string),
+                                .session_id = session_id,
+                                .is_error = is_error,
+                            };
                         }
                     }
                 }
@@ -257,8 +321,9 @@ test "parseStreamJson extracts result" {
         \\{"type":"result","result":"Hello from Claude CLI!"}
     ;
     const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Claude CLI!", result);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+    try std.testing.expectEqualStrings("Hello from Claude CLI!", result.content);
 }
 
 test "parseStreamJson no result returns error" {
@@ -281,8 +346,9 @@ test "parseStreamJson handles invalid json lines gracefully" {
         \\{"type":"result","result":"found it"}
     ;
     const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("found it", result);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+    try std.testing.expectEqualStrings("found it", result.content);
 }
 
 test "parseStreamJson skips result with non-string value" {
@@ -291,6 +357,51 @@ test "parseStreamJson skips result with non-string value" {
     ;
     const result = ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
     try std.testing.expectError(error.NoResultInOutput, result);
+}
+
+test "parseStreamJson extracts session_id field" {
+    const input =
+        \\{"type":"result","result":"ok","session_id":"702fc7d0-a779-4091-892e-b84fb1e0b345"}
+    ;
+    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+
+    try std.testing.expectEqualStrings("ok", result.content);
+    try std.testing.expect(result.session_id != null);
+    try std.testing.expectEqualStrings("702fc7d0-a779-4091-892e-b84fb1e0b345", result.session_id.?);
+}
+
+test "parseStreamJson returns null session_id when field missing" {
+    const input =
+        \\{"type":"result","result":"ok"}
+    ;
+    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+
+    try std.testing.expect(result.session_id == null);
+}
+
+test "parseStreamJson extracts is_error field" {
+    const input =
+        \\{"type":"result","result":"invalid model","is_error":true}
+    ;
+    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
+    defer std.testing.allocator.free(result.content);
+    defer if (result.session_id) |sid| std.testing.allocator.free(sid);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("invalid model", result.content);
+}
+
+test "ClaudeResult defaults are correct" {
+    const result = ClaudeCliProvider.ClaudeResult{
+        .content = "sample",
+    };
+    try std.testing.expectEqualStrings("sample", result.content);
+    try std.testing.expect(result.session_id == null);
+    try std.testing.expect(!result.is_error);
 }
 
 test "ClaudeCliProvider vtable has correct function pointers" {
